@@ -44,6 +44,8 @@ def conv_5_3_hook(module, input, output):
     return None
 
 
+# CONTEXT-AWARE PYRAMID FEATURE EXTRACTION SUBNETWORK
+# aqui são retiradas as features das convolucionais 3-3, 4-3 e 5-3 da VGG16
 class CPFE(nn.Module):
     def __init__(self, feature_layer=None, out_channels=32):
         super(CPFE, self).__init__()
@@ -90,6 +92,7 @@ class SODModel(nn.Module):
         # Load the [partial] VGG-16 model
         self.vgg16 = models.vgg16(pretrained=True).features
 
+        # RETRIEVING VGG16 FEATURES, LEFT-SIDE OF IMAGE2
         # Extract and register intermediate features of VGG-16
         self.vgg16[3].register_forward_hook(conv_1_2_hook)
         self.vgg16[8].register_forward_hook(conv_2_2_hook)
@@ -97,16 +100,19 @@ class SODModel(nn.Module):
         self.vgg16[22].register_forward_hook(conv_4_3_hook)
         self.vgg16[29].register_forward_hook(conv_5_3_hook)
 
+        # LOWER BRANCH
         # Initialize layers for high level (hl) feature (conv3_3, conv4_3, conv5_3) processing
         self.cpfe_conv3_3 = CPFE(feature_layer='conv3_3')
         self.cpfe_conv4_3 = CPFE(feature_layer='conv4_3')
         self.cpfe_conv5_3 = CPFE(feature_layer='conv5_3')
 
+        # CHANNELWISE ATTENTION, CA BLOCK
         self.cha_att = ChannelwiseAttention(in_channels=384)  # in_channels = 3 x (32 x 4)
 
         self.hl_conv1 = nn.Conv2d(384, 64, (3, 3), padding=1)
         self.hl_bn1 = nn.BatchNorm2d(64)
 
+        # UPPER BRANCH
         # Initialize layers for low level (ll) feature (conv1_2 and conv2_2) processing
         self.ll_conv_1 = nn.Conv2d(64, 64, (3, 3), padding=1)
         self.ll_bn_1 = nn.BatchNorm2d(64)
@@ -115,6 +121,7 @@ class SODModel(nn.Module):
         self.ll_conv_3 = nn.Conv2d(128, 64, (3, 3), padding=1)
         self.ll_bn_3 = nn.BatchNorm2d(64)
 
+        # SPATIAL ATTENTION, SA BLOCK
         self.spa_att = SpatialAttention(in_channels=64)
 
         # Initialize layers for fused features (ff) processing
@@ -132,6 +139,8 @@ class SODModel(nn.Module):
         # print(vgg_conv5_3.size())
 
         # Process high level features
+        # LOWER BRANCH
+        # CPFE
         conv3_cpfe_feats = self.cpfe_conv3_3(vgg_conv3_3)
         conv4_cpfe_feats = self.cpfe_conv4_3(vgg_conv4_3)
         conv5_cpfe_feats = self.cpfe_conv5_3(vgg_conv5_3)
@@ -139,31 +148,47 @@ class SODModel(nn.Module):
         conv4_cpfe_feats = F.interpolate(conv4_cpfe_feats, scale_factor=2, mode='bilinear', align_corners=True)
         conv5_cpfe_feats = F.interpolate(conv5_cpfe_feats, scale_factor=4, mode='bilinear', align_corners=True)
 
+        # CAT ALL CPFE RESULTS; 64x64x384 BLOCK
         conv_345_feats = torch.cat((conv3_cpfe_feats, conv4_cpfe_feats, conv5_cpfe_feats), dim=1)
 
+        # CHANNELWISE ATTENTION BLOCK      
         conv_345_ca, ca_act_reg = self.cha_att(conv_345_feats)
         conv_345_feats = torch.mul(conv_345_feats, conv_345_ca)
 
+        # 1x1x64 CONVOLUTIONAL
         conv_345_feats = self.hl_conv1(conv_345_feats)
         conv_345_feats = F.relu(self.hl_bn1(conv_345_feats))
+
+        # UPSCALE
         conv_345_feats = F.interpolate(conv_345_feats, scale_factor=4, mode='bilinear', align_corners=True)
 
         # Process low level features
+        # HIGHER BRANCH
+        # LOWER FEATURES
         conv1_feats = self.ll_conv_1(vgg_conv1_2)
         conv1_feats = F.relu(self.ll_bn_1(conv1_feats))
         conv2_feats = self.ll_conv_2(vgg_conv2_2)
         conv2_feats = F.relu(self.ll_bn_2(conv2_feats))
 
         conv2_feats = F.interpolate(conv2_feats, scale_factor=2, mode='bilinear', align_corners=True)
+
+        # CAT ALL LOWER FEATURES RESULTS, 256x256x192 BLOCK
         conv_12_feats = torch.cat((conv1_feats, conv2_feats), dim=1)
+
+        # PASS ON 3x3x64 CONVOLUTIONAL
         conv_12_feats = self.ll_conv_3(conv_12_feats)
         conv_12_feats = F.relu(self.ll_bn_3(conv_12_feats))
 
+
+        # SPATIAL ATTENTION, SA BLOCK
         conv_12_sa = self.spa_att(conv_345_feats)
         conv_12_feats = torch.mul(conv_12_feats, conv_12_sa)
 
         # Fused features
+        # CAT BOTH BRANCHES BLOCKS
         fused_feats = torch.cat((conv_12_feats, conv_345_feats), dim=1)
+
+        # PASSES ON LAST CONV AND THEN SIGMOID IT
         fused_feats = torch.sigmoid(self.ff_conv_1(fused_feats))
 
         return fused_feats, ca_act_reg
